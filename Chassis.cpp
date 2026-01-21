@@ -126,18 +126,23 @@ void Chassis::driveWithTime(float forwardDistance, float targetSeconds) {
     float elapsedSeconds = (millis() - startTime) / 1000.0;
     forwardSpeed = calculateSpeed(forwardDistance, targetSeconds2, elapsedSeconds);
 
-float kStraight = 0.6;  // need to tune
+float kStraight = 0.4;  // need to tune
 
     int baseTicks = (forwardSpeed * (ctrlIntervalMS / 1000.0)) / cmPerEncoderTick;
 
+long leftStart  = leftMotor.getCount();
+long rightStart = rightMotor.getCount();
+
 // encoder difference = heading error
-long error = leftMotor.getCount() - rightMotor.getCount();
+long error =
+  (leftMotor.getCount() - leftStart) -
+  (rightMotor.getCount() - rightStart);
 
 // proportional straightness correction
 int correction = kStraight * error;  
 correction = constrain(correction, -5, 5);
 
-int baseCorrection = 5;
+int baseCorrection = 0;
 
 // bias speeds (this does NOT turn — it cancels drift)
 leftMotor.targetSpeed  = baseTicks - correction - baseCorrection;

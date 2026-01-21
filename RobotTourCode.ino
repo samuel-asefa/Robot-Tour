@@ -2,99 +2,167 @@
 #include "Chassis.h"
 #include "Romi32U4Buttons.h"
 
+#include <Wire.h>
+#include <LSM6.h>
 
-// encoder count targets, tune by turning 16 times and changing numbers untill offset is 0
-#define NIGHTY_LEFT_TURN_COUNT -716
-#define NIGHTY_RIGHT_TURN_COUNT 712
+/* =========================================================
+   CONSTANTS / HARDWARE CONFIG
+   ========================================================= */
 
+// encoder count targets (kept for turning)
+#define NIGHTY_LEFT_TURN_COUNT  -716
+#define NIGHTY_RIGHT_TURN_COUNT  712
 
-// 716 712
-// positive = boost right motor; negative = boost left motor
-
-// F and B go forward/backwards 50 cm by default, but other distances can be easily specified by adding a number after the letter
-// S and E go the start/end distance
-// L and R are left and right
-// targetTime is target time (duh)
-//char moves[200] = "B67 R F L F30 R R F60 B30 R F L F R F L F L F80 B80 L F L F L F30 B30 L F L F L F R F30 B30 R E";
-
-// R R R R
+// path string
 char moves[200] = "2F R R R R";
-double targetTime = 6; //75
-double endDist = 41;
+
+// global timing targets
+double targetTime = 6.0;
+double endDist   = 41;
 double startDist = -16;
 
-// parameters are wheel diam, encoder counts, wheel track (tune these to your own hardware)
+// chassis params
 Chassis chassis(7, 1440, 14);
 Romi32U4ButtonA buttonA;
 
+// IMU
+LSM6 imu;
 
-// define the states
-enum ROBOT_STATE { ROBOT_IDLE,
-                   ROBOT_MOVE,
-                   MOVING };
+/* =========================================================
+   ROBOT STATE
+   ========================================================= */
+
+enum ROBOT_STATE {
+  ROBOT_IDLE,
+  ROBOT_MOVE
+};
+
 ROBOT_STATE robotState = ROBOT_IDLE;
 
+/* =========================================================
+   GYRO / HEADING CONTROL
+   ========================================================= */
 
-// a helper function to stop the motors
-void idle(void) {
-  Serial.println("idle()");
+float headingDeg = 0.0;
+unsigned long lastGyroMicros = 0;
+
+// PID (gyro)
+float kP_gyro = 1.2;
+float kD_gyro = 0.08;
+
+float gyroBiasZ = 0.0;
+
+
+void calibrateGyro() {
+  const int samples = 500;
+  long sum = 0;
+
+  Serial.println("Calibrating gyro... keep robot still");
+
+  for (int i = 0; i < samples; i++) {
+    imu.read();
+    sum += imu.g.z;
+    delay(5);
+  }
+
+  gyroBiasZ = (sum / (float)samples) / 1000.0;
+  Serial.println("Gyro calibration done");
+}
+
+
+float gyroError = 0;
+float gyroPrevError = 0;
+
+float targetHeading = 0;
+
+/* =========================================================
+   UTILITY
+   ========================================================= */
+
+void idle() {
   chassis.idle();
   robotState = ROBOT_IDLE;
 }
 
-void setup() {
-  Serial.begin(115200);
-  chassis.init();
-  chassis.setMotorPIDcoeffs(7, 1.0);
+/* =========================================================
+   GYRO FUNCTIONS
+   ========================================================= */
+
+void resetHeading() {
+  headingDeg = 0;
+  gyroPrevError = 0;
+  lastGyroMicros = micros();
 }
 
-void turnLeft() {
-  chassis.turnFor(89, 60);
-  delay(100);
-  chassis.turnFor(89, 60);
-  delay(100);
+void updateGyro() {
+  imu.read();
+
+  unsigned long now = micros();
+  float dt = (now - lastGyroMicros) / 1000000.0;
+  lastGyroMicros = now;
+
+  float gyroZ = (imu.g.z / 1000.0) - gyroBiasZ;
+  headingDeg += gyroZ * dt;
 }
 
-void left() {
-  chassis.turnFor(3, 60);
-  delay(100);
+
+/* =========================================================
+   STRAIGHT DRIVE USING GYRO (TIME-BASED)
+   ========================================================= */
+
+void driveStraightGyro(double distCm, double timeSec) {
+  resetHeading();
+  targetHeading = 0;
+
+  unsigned long start = millis();
+  unsigned long duration = timeSec * 1000;
+
+  int baseSpeed = (distCm >= 0) ? 60 : -60;
+
+  while (millis() - start < duration) {
+    updateGyro();
+
+    gyroError = targetHeading - headingDeg;
+    float gyroDerivative = gyroError - gyroPrevError;
+    gyroPrevError = gyroError;
+
+    float correction = kP_gyro * gyroError + kD_gyro * gyroDerivative;
+
+
+    int leftEffort  = baseSpeed - correction;
+int rightEffort = baseSpeed + correction;
+
+
+    // clamp for safety
+    leftEffort  = constrain(leftEffort,  -100, 100);
+    rightEffort = constrain(rightEffort, -100, 100);
+
+    chassis.setMotorEfforts(leftEffort, rightEffort);
+
+    delay(5);
+  }
+
+  chassis.idle();
+  delay(40);
 }
 
-// CORRECTIONS FOR TURNING STRAIGHT
 
-void leftTurnCorrection(float correctionLeft) {
-  chassis.turnFor(-correctionLeft, 60); // PRIOR TO THE MOVEMENT
+/* =========================================================
+   TURNING (UNCHANGED)
+   ========================================================= */
 
-   
-
-  delay(100);
-  
-}
-void rightTurnCorrection(float correctionRight) {
-  chassis.turnFor(-correctionRight, 60);
-
-   
-
-  delay(100);
-  
-}
-
-void turnRight() {
-  chassis.turnFor(-87, 60);
-  delay(100);
-}
-
-void left(float seconds) {
+void left(double seconds) {
   chassis.turnWithTimePosPid(NIGHTY_LEFT_TURN_COUNT, seconds);
 }
 
-void right(float seconds) {
+void right(double seconds) {
   chassis.turnWithTimePosPid(NIGHTY_RIGHT_TURN_COUNT, seconds);
 }
 
-// =================== New Helper Functions (2F-5F) ==================
+/* =========================================================
+   PATH PARSING HELPERS (UNCHANGED)
+   ========================================================= */
 
-// returns leading number (2F -> 2). Defaults to 1 if none.
 int getMoveMultiplier(String st) {
   int i = 0;
   while (i < st.length() && isDigit(st[i])) i++;
@@ -102,7 +170,6 @@ int getMoveMultiplier(String st) {
   return st.substring(0, i).toInt();
 }
 
-// returns command letter (F, B, L, R, S, E)
 char getMoveCommand(String st) {
   for (int i = 0; i < st.length(); i++) {
     if (isAlpha(st[i])) return st[i];
@@ -110,7 +177,6 @@ char getMoveCommand(String st) {
   return '?';
 }
 
-// returns distance after command (3F30 -> 30), otherwise default
 double getMoveDistance(String st, double defaultDist) {
   int i = 0;
   while (i < st.length() && !isAlpha(st[i])) i++;
@@ -119,176 +185,118 @@ double getMoveDistance(String st, double defaultDist) {
   return defaultDist;
 }
 
+/* =========================================================
+   SETUP
+   ========================================================= */
+
+void setup() {
+  Serial.begin(115200);
+
+  chassis.init();
+  chassis.setMotorPIDcoeffs(7, 1.0);
+
+  Wire.begin();                 // 1️⃣ I2C FIRST
+
+  if (!imu.init()) {            // 2️⃣ IMU INIT
+    Serial.println("IMU INIT FAILED");
+    while (1);
+  }
+
+  imu.enableDefault();          // 3️⃣ ENABLE SENSOR
+  delay(500);
+
+  calibrateGyro();              // 4️⃣ NOW IT IS SAFE
+}
+
+
+/* =========================================================
+   MAIN LOOP
+   ========================================================= */
+
 void loop() {
+char movesCopy[200];
+strcpy(movesCopy, moves);
+
   if (buttonA.getSingleDebouncedPress()) {
     delay(300);
     robotState = ROBOT_MOVE;
   }
 
-  if (robotState == ROBOT_MOVE) {
+  if (robotState != ROBOT_MOVE) return;
 
-    int count = 1;
-    for (int i = 0; i < strlen(moves); i++)
-      if (isSpace(moves[i])) count++;
+  /* ===== TOKENIZE PATH ===== */
 
-    char *movesList[count];
-    char *ptr = NULL;
+  int count = 1;
+  for (int i = 0; i < strlen(moves); i++)
+    if (isSpace(moves[i])) count++;
 
-    byte index = 0;
-    ptr = strtok(moves, " ");
-    while (ptr != NULL) {
-      movesList[index] = ptr;
-      index++;
-      ptr = strtok(NULL, " ");
-    }
+  char *movesList[count];
+  char *ptr = strtok(movesCopy, " ");
+  int idx = 0;
 
-    int numTurns = 0;
-    double totalDist = 0;
-    char currentChar;
-    String st;
-
-    // ===== COUNT TURNS + DISTANCE =====
-    for (int i = 0; i < count; i++) {
-      st = movesList[i];
-      currentChar = getMoveCommand(st);
-
-      if (currentChar == 'R' || currentChar == 'L') {
-        numTurns++;
-      }
-      else if (currentChar == 'F' || currentChar == 'B') {   
-    int multiplier = getMoveMultiplier(st);         // 2F → 2
-    double dist = getMoveDistance(st, 50);
-    totalDist += dist * multiplier;                 // account for multiple Fs
-}
-
-      /*else if (currentChar == 'F' || currentChar == 'B') {
-        
-        totalDist += getMoveDistance(st, 50);
-      }*/
-      else if (currentChar == 'S') {
-        totalDist += abs(startDist);
-      }
-      else if (currentChar == 'E') {
-        totalDist += abs(endDist);
-      }
-    }
-
-    double turnTime = 0.55;
-    double totalTurnTime = 0.65 * numTurns;
-    double totalDriveTime = targetTime - totalTurnTime - 0.0029 * totalDist;
-
-    // ===== EXECUTE MOVES =====
-    for (int i = 0; i < count; i++) {
-
-      st = movesList[i];
-      char cmd = getMoveCommand(st);
-      int mode = getMoveMultiplier(st);
-      double dist = getMoveDistance(st, 50) * mode;
-
-      double timeFrac = (dist) / totalDist * totalDriveTime;
-      // double timeFrac = (dist * mode) / totalDist * totalDriveTime;
-      double minTimeFrac = 0.15; // safe minimum for Romi
-
-      if (timeFrac < minTimeFrac) 
-        timeFrac = minTimeFrac;
-
-      if (cmd == 'R') {
-        right(turnTime);
-      }
-      else if (cmd == 'L') {
-        left(turnTime);
-      }
-      else if (cmd == 'F') {
-        float afterCorrectionFactor = 0; 
-        float beforeCorrectionFactor = 0;
-
-          switch(mode) {
-              case 1: 
-                afterCorrectionFactor = 1.0; 
-                beforeCorrectionFactor = 1;
-                break;  // F
-              case 2: 
-                afterCorrectionFactor = 0.75; 
-                beforeCorrectionFactor = 0.75; // SHOULD BE HIGHER SINCE MORE ERROR FAVORING LEFT SIDE WILL ACCUMULATE
-                break;  // 2F
-              case 3: 
-                afterCorrectionFactor = 0.3; 
-                beforeCorrectionFactor = 0;
-                break;  // 3F
-              case 4: 
-                afterCorrectionFactor = 0.25; 
-                beforeCorrectionFactor = 0;
-                break;  // 4F
-              case 5: 
-                afterCorrectionFactor = 0.25; 
-                beforeCorrectionFactor = 0;
-                break; // 5F almost no correction
-              default: 
-                afterCorrectionFactor = 0.5;
-                beforeCorrectionFactor = 0;
-          }
-          leftTurnCorrection(beforeCorrectionFactor);
-          chassis.driveWithTime(dist, timeFrac);
-          rightTurnCorrection(afterCorrectionFactor);
-          chassis.idle();
-          delay(40);
-/*
-        // ================= F =================
-        if (mode == 1) {
-          chassis.driveWithTime(dist, timeFrac);
-          rightTurnCorrection(0.5);
-          chassis.idle();
-          delay(40);
-        }
-
-        // ================= 2F =================
-        else if (mode == 2) {
-          // CUSTOM 2F LOGIC HERE
-          chassis.driveWithTime(dist, timeFrac);
-          rightTurnCorrection(0.4);
-          chassis.idle();
-          delay(40);
-
-        }
-
-        // ================= 3F =================
-        else if (mode == 3) {
-          // CUSTOM 3F LOGIC HERE
-          chassis.driveWithTime(dist, timeFrac);
-          rightTurnCorrection(0.3);
-          chassis.idle();
-          delay(40);
-        }
-
-        // ================= 4F =================
-        else if (mode == 4) {
-          // CUSTOM 4F LOGIC HERE
-          chassis.driveWithTime(dist, timeFrac);
-          rightTurnCorrection(0.2);
-          chassis.idle();
-          delay(40);
-        }
-
-        // ================= 5F =================
-        else if (mode == 5) {
-          // CUSTOM 5F LOGIC HERE
-          chassis.driveWithTime(dist, timeFrac);
-          rightTurnCorrection(0.15);
-          chassis.idle();
-          delay(40);
-        }*/
-      }
-      else if (cmd == 'B') {
-        chassis.driveWithTime(-dist, timeFrac);
-      }
-      else if (cmd == 'S') {
-        chassis.driveWithTime(startDist, abs(startDist)/totalDist * totalDriveTime);
-      }
-      else if (cmd == 'E') {
-        chassis.driveWithTime(endDist, abs(endDist)/totalDist * totalDriveTime);
-      }
-    }
-
-    idle();
+  while (ptr != NULL) {
+    movesList[idx++] = ptr;
+    ptr = strtok(NULL, " ");
   }
+
+  /* ===== PRE-SCAN ===== */
+
+  int numTurns = 0;
+  double totalDist = 0;
+
+  for (int i = 0; i < count; i++) {
+    String st = movesList[i];
+    char cmd = getMoveCommand(st);
+
+    if (cmd == 'L' || cmd == 'R') {
+      numTurns++;
+    }
+    else if (cmd == 'F' || cmd == 'B') {
+      int mult = getMoveMultiplier(st);
+      double dist = getMoveDistance(st, 50);
+      totalDist += dist * mult;
+    }
+    else if (cmd == 'S') totalDist += abs(startDist);
+    else if (cmd == 'E') totalDist += abs(endDist);
+  }
+
+  /* ===== TIME ALLOCATION ===== */
+
+  double turnTime = 0.55;
+  double totalTurnTime = 0.65 * numTurns;
+  double totalDriveTime = targetTime - totalTurnTime - 0.0029 * totalDist;
+
+  /* ===== EXECUTION ===== */
+
+  for (int i = 0; i < count; i++) {
+
+    String st = movesList[i];
+    char cmd = getMoveCommand(st);
+    int mult = getMoveMultiplier(st);
+    double dist = getMoveDistance(st, 50) * mult;
+
+    double timeFrac = (abs(dist) / totalDist) * totalDriveTime;
+    if (timeFrac < 0.15) timeFrac = 0.15;
+
+    if (cmd == 'L') {
+      left(turnTime);
+    }
+    else if (cmd == 'R') {
+      right(turnTime);
+    }
+    else if (cmd == 'F') {
+      driveStraightGyro(dist, timeFrac);
+    }
+    else if (cmd == 'B') {
+      driveStraightGyro(-dist, timeFrac);
+    }
+    else if (cmd == 'S') {
+      driveStraightGyro(startDist, abs(startDist) / totalDist * totalDriveTime);
+    }
+    else if (cmd == 'E') {
+      driveStraightGyro(endDist, abs(endDist) / totalDist * totalDriveTime);
+    }
+  }
+
+  idle();
 }
